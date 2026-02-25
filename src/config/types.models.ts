@@ -39,6 +39,16 @@ export type ModelDefinitionConfig = {
   maxTokens: number;
   headers?: Record<string, string>;
   compat?: ModelCompatConfig;
+  /**
+   * Static JSON object always deep-merged into every request payload for this model.
+   * Supports \`${thinkingBudget}\` placeholder (replaced with numeric budget based on ThinkLevel).
+   */
+  payloadPatch?: Record<string, unknown>;
+  /**
+   * Static JSON object deep-merged into the request payload only when thinking is enabled.
+   * Supports \`${thinkingBudget}\` placeholder (replaced with numeric budget based on ThinkLevel).
+   */
+  thinkingPayloadPatch?: Record<string, unknown>;
 };
 
 export type ModelProviderConfig = {

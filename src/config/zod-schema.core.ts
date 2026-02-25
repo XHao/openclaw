@@ -52,6 +52,8 @@ export const ModelDefinitionSchema = z
     maxTokens: z.number().positive().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     compat: ModelCompatSchema,
+    payloadPatch: z.record(z.string(), z.unknown()).optional(),
+    thinkingPayloadPatch: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();
 

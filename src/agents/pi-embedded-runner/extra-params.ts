@@ -502,6 +502,137 @@ function createZaiToolStreamWrapper(
 }
 
 /**
+ * Map OpenClaw's ThinkLevel to a numeric thinking_budget value.
+ * Used as the substitution target for the `${thinkingBudget}` placeholder.
+ */
+function mapThinkingLevelToBudget(level: ThinkLevel): number {
+  switch (level) {
+    case "minimal":
+      return 512;
+    case "low":
+      return 1024;
+    case "medium":
+      return 2048;
+    case "high":
+      return 4096;
+    case "xhigh":
+      return 8192;
+    default:
+      return 1024;
+  }
+}
+
+/**
+ * Recursively deep-merge `patch` into `target` in place.
+ * Objects are merged; all other types (arrays, primitives) are overwritten.
+ */
+function deepMergePayload(target: Record<string, unknown>, patch: Record<string, unknown>): void {
+  for (const [k, v] of Object.entries(patch)) {
+    if (
+      v !== null &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      target[k] !== null &&
+      typeof target[k] === "object" &&
+      !Array.isArray(target[k])
+    ) {
+      deepMergePayload(target[k] as Record<string, unknown>, v as Record<string, unknown>);
+    } else {
+      target[k] = v;
+    }
+  }
+}
+
+/**
+ * Recursively replace the string literal `"${thinkingBudget}"` with the
+ * numeric budget value throughout an arbitrary JSON-compatible value.
+ */
+function substituteThinkingPlaceholders(obj: unknown, budget: number): unknown {
+  if (typeof obj === "string") {
+    return obj === "${thinkingBudget}" ? budget : obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map((item) => substituteThinkingPlaceholders(item, budget));
+  }
+  if (obj !== null && typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      result[k] = substituteThinkingPlaceholders(v, budget);
+    }
+    return result;
+  }
+  return obj;
+}
+
+/**
+ * Create a streamFn wrapper that deep-merges config-supplied payload patches
+ * into every request.
+ *
+ * - `payloadPatch`        — always merged (useful for static routing/header fields).
+ * - `thinkingPayloadPatch` — merged only when thinking is enabled.
+ *
+ * Both patches support the `"${thinkingBudget}"` placeholder in string values,
+ * which is replaced at request time with the numeric budget derived from the
+ * current ThinkLevel.
+ *
+ * This lets third-party OpenAI-compatible proxies that require non-standard
+ * thinking fields be configured entirely via `openclaw.json` without code changes.
+ *
+ * @example
+ * // Google Gemini proxy via aigc.sankuai.com:
+ * "thinkingPayloadPatch": {
+ *   "extra_body": {
+ *     "google": {
+ *       "thinking_config": {
+ *         "include_thoughts": true,
+ *         "thinking_budget": "${thinkingBudget}"
+ *       }
+ *     }
+ *   }
+ * }
+ */
+function createPayloadPatchWrapper(
+  baseStreamFn: StreamFn | undefined,
+  payloadPatch: Record<string, unknown> | undefined,
+  thinkingPayloadPatch: Record<string, unknown> | undefined,
+  thinkingLevel: ThinkLevel | undefined,
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    const originalOnPayload = options?.onPayload;
+    return underlying(model, context, {
+      ...options,
+      onPayload: (payload) => {
+        if (payload && typeof payload === "object") {
+          const p = payload as Record<string, unknown>;
+          const budget =
+            thinkingLevel && thinkingLevel !== "off"
+              ? mapThinkingLevelToBudget(thinkingLevel)
+              : 1024;
+
+          if (payloadPatch) {
+            const resolved = substituteThinkingPlaceholders(payloadPatch, budget) as Record<
+              string,
+              unknown
+            >;
+            deepMergePayload(p, resolved);
+          }
+
+          if (thinkingPayloadPatch && thinkingLevel && thinkingLevel !== "off") {
+            const resolved = substituteThinkingPlaceholders(thinkingPayloadPatch, budget) as Record<
+              string,
+              unknown
+            >;
+            deepMergePayload(p, resolved);
+          }
+        }
+        originalOnPayload?.(payload);
+      },
+    });
+  };
+}
+
+/**
  * Apply extra params (like temperature) to an agent's streamFn.
  * Also adds OpenRouter app attribution headers when using the OpenRouter provider.
  *
@@ -570,6 +701,20 @@ export function applyExtraParamsToAgent(
       log.debug(`enabling Z.AI tool_stream for ${provider}/${modelId}`);
       agent.streamFn = createZaiToolStreamWrapper(agent.streamFn, true);
     }
+  }
+
+  // Apply config-supplied payload patches for custom/proxy providers.
+  // `payloadPatch` is always merged; `thinkingPayloadPatch` only when thinking is on.
+  // Both support `"${thinkingBudget}"` placeholder substitution.
+  const modelDef = cfg?.models?.providers?.[provider]?.models?.find((m) => m.id === modelId);
+  if (modelDef?.payloadPatch ?? modelDef?.thinkingPayloadPatch) {
+    log.debug(`applying payload patch for ${provider}/${modelId}`);
+    agent.streamFn = createPayloadPatchWrapper(
+      agent.streamFn,
+      modelDef.payloadPatch,
+      modelDef.thinkingPayloadPatch,
+      thinkingLevel,
+    );
   }
 
   // Work around upstream pi-ai hardcoding `store: false` for Responses API.
