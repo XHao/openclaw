@@ -90,6 +90,7 @@ export const HeartbeatSchema = z
 
 export const SandboxDockerSchema = z
   .object({
+    cmd: z.string().optional(),
     image: z.string().optional(),
     containerPrefix: z.string().optional(),
     workdir: z.string().optional(),

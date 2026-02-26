@@ -6,6 +6,8 @@ type ExecDockerRawOptions = {
   allowFailure?: boolean;
   input?: Buffer | string;
   signal?: AbortSignal;
+  /** Container runtime command (default: "docker"). Use "container" for macOS native. */
+  cmd?: string;
 };
 
 export type ExecDockerRawResult = {
@@ -30,8 +32,9 @@ export function execDockerRaw(
   args: string[],
   opts?: ExecDockerRawOptions,
 ): Promise<ExecDockerRawResult> {
+  const runtimeCmd = opts?.cmd ?? "docker";
   return new Promise<ExecDockerRawResult>((resolve, reject) => {
-    const child = spawn("docker", args, {
+    const child = spawn(runtimeCmd, args, {
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdoutChunks: Buffer[] = [];
@@ -82,7 +85,7 @@ export function execDockerRaw(
       if (exitCode !== 0 && !opts?.allowFailure) {
         const message = stderr.length > 0 ? stderr.toString("utf8").trim() : "";
         const error: ExecDockerRawError = Object.assign(
-          new Error(message || `docker ${args.join(" ")} failed`),
+          new Error(message || `${runtimeCmd} ${args.join(" ")} failed`),
           {
             code: exitCode,
             stdout,
@@ -133,10 +136,11 @@ export async function execDocker(args: string[], opts?: ExecDockerOptions) {
 export async function readDockerContainerLabel(
   containerName: string,
   label: string,
+  cmd?: string,
 ): Promise<string | null> {
   const result = await execDocker(
     ["inspect", "-f", `{{ index .Config.Labels "${label}" }}`, containerName],
-    { allowFailure: true },
+    { allowFailure: true, cmd },
   );
   if (result.code !== 0) {
     return null;
@@ -151,10 +155,11 @@ export async function readDockerContainerLabel(
 export async function readDockerContainerEnvVar(
   containerName: string,
   envVar: string,
+  cmd?: string,
 ): Promise<string | null> {
   const result = await execDocker(
     ["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", containerName],
-    { allowFailure: true },
+    { allowFailure: true, cmd },
   );
   if (result.code !== 0) {
     return null;
@@ -167,9 +172,10 @@ export async function readDockerContainerEnvVar(
   return null;
 }
 
-export async function readDockerPort(containerName: string, port: number) {
+export async function readDockerPort(containerName: string, port: number, cmd?: string) {
   const result = await execDocker(["port", containerName, `${port}/tcp`], {
     allowFailure: true,
+    cmd,
   });
   if (result.code !== 0) {
     return null;
@@ -183,9 +189,10 @@ export async function readDockerPort(containerName: string, port: number) {
   return Number.isFinite(mapped) ? mapped : null;
 }
 
-async function dockerImageExists(image: string) {
+async function dockerImageExists(image: string, cmd?: string) {
   const result = await execDocker(["image", "inspect", image], {
     allowFailure: true,
+    cmd,
   });
   if (result.code === 0) {
     return true;
@@ -197,22 +204,24 @@ async function dockerImageExists(image: string) {
   throw new Error(`Failed to inspect sandbox image: ${stderr}`);
 }
 
-export async function ensureDockerImage(image: string) {
-  const exists = await dockerImageExists(image);
+export async function ensureDockerImage(image: string, cmd?: string) {
+  const exists = await dockerImageExists(image, cmd);
   if (exists) {
     return;
   }
   if (image === DEFAULT_SANDBOX_IMAGE) {
-    await execDocker(["pull", "debian:bookworm-slim"]);
-    await execDocker(["tag", "debian:bookworm-slim", DEFAULT_SANDBOX_IMAGE]);
+    await execDocker(["pull", "debian:bookworm-slim"], { cmd });
+    await execDocker(["tag", "debian:bookworm-slim", DEFAULT_SANDBOX_IMAGE], { cmd });
     return;
   }
-  throw new Error(`Sandbox image not found: ${image}. Build or pull it first.`);
+  // For any other image (e.g. ghcr.io/* or custom registries), attempt to pull automatically.
+  await execDocker(["pull", image], { cmd });
 }
 
-export async function dockerContainerState(name: string) {
+export async function dockerContainerState(name: string, cmd?: string) {
   const result = await execDocker(["inspect", "-f", "{{.State.Running}}", name], {
     allowFailure: true,
+    cmd,
   });
   if (result.code !== 0) {
     return { exists: false, running: false };
@@ -267,6 +276,8 @@ export function buildSandboxCreateArgs(params: {
   bindSourceRoots?: string[];
   allowSourcesOutsideAllowedRoots?: boolean;
   allowReservedContainerTargets?: boolean;
+  /** Container runtime command; defaults to cfg.cmd or "docker". */
+  cmd?: string;
 }) {
   // Runtime security validation: blocks dangerous bind mounts, network modes, and profiles.
   validateSandboxSecurity({
@@ -279,6 +290,10 @@ export function buildSandboxCreateArgs(params: {
       params.allowReservedContainerTargets ??
       params.cfg.dangerouslyAllowReservedContainerTargets === true,
   });
+
+  // macOS native container runtime does not support Docker-specific security flags
+  const runtimeCmd = params.cmd ?? params.cfg.cmd ?? "docker";
+  const isMacOSNative = runtimeCmd === "container";
 
   const createdAtMs = params.createdAtMs ?? Date.now();
   const args = ["create", "--name", params.name];
@@ -293,7 +308,8 @@ export function buildSandboxCreateArgs(params: {
       args.push("--label", `${key}=${value}`);
     }
   }
-  if (params.cfg.readOnlyRoot) {
+  // --read-only: not supported by macOS native container engine
+  if (params.cfg.readOnlyRoot && !isMacOSNative) {
     args.push("--read-only");
   }
   for (const entry of params.cfg.tmpfs) {
@@ -315,36 +331,46 @@ export function buildSandboxCreateArgs(params: {
   for (const [key, value] of Object.entries(envSanitization.allowed)) {
     args.push("--env", `${key}=${value}`);
   }
-  for (const cap of params.cfg.capDrop) {
-    args.push("--cap-drop", cap);
-  }
-  args.push("--security-opt", "no-new-privileges");
-  if (params.cfg.seccompProfile) {
-    args.push("--security-opt", `seccomp=${params.cfg.seccompProfile}`);
-  }
-  if (params.cfg.apparmorProfile) {
-    args.push("--security-opt", `apparmor=${params.cfg.apparmorProfile}`);
+  // --cap-drop, --security-opt: not supported by macOS native container engine
+  if (!isMacOSNative) {
+    for (const cap of params.cfg.capDrop) {
+      args.push("--cap-drop", cap);
+    }
+    args.push("--security-opt", "no-new-privileges");
+    if (params.cfg.seccompProfile) {
+      args.push("--security-opt", `seccomp=${params.cfg.seccompProfile}`);
+    }
+    if (params.cfg.apparmorProfile) {
+      args.push("--security-opt", `apparmor=${params.cfg.apparmorProfile}`);
+    }
   }
   for (const entry of params.cfg.dns ?? []) {
     if (entry.trim()) {
       args.push("--dns", entry);
     }
   }
-  for (const entry of params.cfg.extraHosts ?? []) {
-    if (entry.trim()) {
-      args.push("--add-host", entry);
+  // --add-host: not supported by macOS native container engine
+  if (!isMacOSNative) {
+    for (const entry of params.cfg.extraHosts ?? []) {
+      if (entry.trim()) {
+        args.push("--add-host", entry);
+      }
     }
   }
-  if (typeof params.cfg.pidsLimit === "number" && params.cfg.pidsLimit > 0) {
+  // --pids-limit: not supported by macOS native container engine
+  if (!isMacOSNative && typeof params.cfg.pidsLimit === "number" && params.cfg.pidsLimit > 0) {
     args.push("--pids-limit", String(params.cfg.pidsLimit));
   }
   const memory = normalizeDockerLimit(params.cfg.memory);
   if (memory) {
     args.push("--memory", memory);
   }
-  const memorySwap = normalizeDockerLimit(params.cfg.memorySwap);
-  if (memorySwap) {
-    args.push("--memory-swap", memorySwap);
+  // --memory-swap: not supported by macOS native container engine
+  if (!isMacOSNative) {
+    const memorySwap = normalizeDockerLimit(params.cfg.memorySwap);
+    if (memorySwap) {
+      args.push("--memory-swap", memorySwap);
+    }
   }
   if (typeof params.cfg.cpus === "number" && params.cfg.cpus > 0) {
     args.push("--cpus", String(params.cfg.cpus));
@@ -382,7 +408,8 @@ async function createSandboxContainer(params: {
   configHash?: string;
 }) {
   const { name, cfg, workspaceDir, scopeKey } = params;
-  await ensureDockerImage(cfg.image);
+  const cmd = cfg.cmd;
+  await ensureDockerImage(cfg.image, cmd);
 
   const args = buildSandboxCreateArgs({
     name,
@@ -391,6 +418,7 @@ async function createSandboxContainer(params: {
     configHash: params.configHash,
     includeBinds: false,
     bindSourceRoots: [workspaceDir, params.agentWorkspaceDir],
+    cmd,
   });
   args.push("--workdir", cfg.workdir);
   const mainMountSuffix =
@@ -406,16 +434,19 @@ async function createSandboxContainer(params: {
   appendCustomBinds(args, cfg);
   args.push(cfg.image, "sleep", "infinity");
 
-  await execDocker(args);
-  await execDocker(["start", name]);
+  await execDocker(args, { cmd });
+  await execDocker(["start", name], { cmd });
 
   if (cfg.setupCommand?.trim()) {
-    await execDocker(["exec", "-i", name, "sh", "-lc", cfg.setupCommand]);
+    await execDocker(["exec", "-i", name, "sh", "-lc", cfg.setupCommand], { cmd });
   }
 }
 
-async function readContainerConfigHash(containerName: string): Promise<string | null> {
-  return await readDockerContainerLabel(containerName, "openclaw.configHash");
+async function readContainerConfigHash(
+  containerName: string,
+  cmd?: string,
+): Promise<string | null> {
+  return await readDockerContainerLabel(containerName, "openclaw.configHash", cmd);
 }
 
 function formatSandboxRecreateHint(params: { scope: SandboxConfig["scope"]; sessionKey: string }) {
@@ -446,7 +477,8 @@ export async function ensureSandboxContainer(params: {
     agentWorkspaceDir: params.agentWorkspaceDir,
   });
   const now = Date.now();
-  const state = await dockerContainerState(containerName);
+  const cmd = params.cfg.docker.cmd;
+  const state = await dockerContainerState(containerName, cmd);
   let hasContainer = state.exists;
   let running = state.running;
   let currentHash: string | null = null;
@@ -460,7 +492,7 @@ export async function ensureSandboxContainer(params: {
   if (hasContainer) {
     const registry = await readRegistry();
     registryEntry = registry.entries.find((entry) => entry.containerName === containerName);
-    currentHash = await readContainerConfigHash(containerName);
+    currentHash = await readContainerConfigHash(containerName, cmd);
     if (!currentHash) {
       currentHash = registryEntry?.configHash ?? null;
     }
@@ -476,7 +508,7 @@ export async function ensureSandboxContainer(params: {
           `Sandbox config changed for ${containerName} (recently used). Recreate to apply: ${hint}`,
         );
       } else {
-        await execDocker(["rm", "-f", containerName], { allowFailure: true });
+        await execDocker(["rm", "-f", containerName], { allowFailure: true, cmd });
         hasContainer = false;
         running = false;
       }
@@ -493,7 +525,7 @@ export async function ensureSandboxContainer(params: {
       configHash: expectedHash,
     });
   } else if (!running) {
-    await execDocker(["start", containerName]);
+    await execDocker(["start", containerName], { cmd });
   }
   await updateRegistry({
     containerName,

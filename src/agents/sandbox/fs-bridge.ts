@@ -240,6 +240,7 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
       input: options.stdin,
       allowFailure: options.allowFailure,
       signal: options.signal,
+      cmd: this.sandbox.docker.cmd,
     });
   }
 

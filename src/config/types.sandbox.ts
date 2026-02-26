@@ -52,6 +52,15 @@ export type SandboxDockerSettings = {
    * (workspace + agent workspace roots).
    */
   dangerouslyAllowExternalBindSources?: boolean;
+  /**
+   * Container runtime command (default: "docker").
+   * Set to "container" to use the macOS native container runtime
+   * (Apple's built-in Virtualization.framework-based engine, available in macOS 26+).
+   * Note: the native "container" engine does not support --cap-drop, --security-opt,
+   * --pids-limit, --memory-swap, --read-only, or --add-host; those flags are skipped
+   * automatically when this is set to "container".
+   */
+  cmd?: string;
 };
 
 export type SandboxBrowserSettings = {

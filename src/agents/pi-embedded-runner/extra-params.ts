@@ -578,6 +578,9 @@ function substituteThinkingPlaceholders(obj: unknown, budget: number): unknown {
  * This lets third-party OpenAI-compatible proxies that require non-standard
  * thinking fields be configured entirely via `openclaw.json` without code changes.
  *
+ * `getThinkingLevel` is a getter so that runtime `/think` level changes are
+ * reflected on every request, not just at session creation time.
+ *
  * @example
  * // Google Gemini proxy via aigc.sankuai.com:
  * "thinkingPayloadPatch": {
@@ -595,10 +598,13 @@ function createPayloadPatchWrapper(
   baseStreamFn: StreamFn | undefined,
   payloadPatch: Record<string, unknown> | undefined,
   thinkingPayloadPatch: Record<string, unknown> | undefined,
-  thinkingLevel: ThinkLevel | undefined,
+  getThinkingLevel: () => ThinkLevel | undefined,
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
+    // Read the live thinking level on each request so that runtime `/think`
+    // changes (e.g. `/think high` in the TUI) are reflected immediately.
+    const thinkingLevel = getThinkingLevel();
     const originalOnPayload = options?.onPayload;
     return underlying(model, context, {
       ...options,
@@ -706,14 +712,27 @@ export function applyExtraParamsToAgent(
   // Apply config-supplied payload patches for custom/proxy providers.
   // `payloadPatch` is always merged; `thinkingPayloadPatch` only when thinking is on.
   // Both support `"${thinkingBudget}"` placeholder substitution.
+  //
+  // We use a getter so that runtime `/think` changes are reflected on each
+  // request, not just at session creation time.  If the caller supplies an
+  // `agent` with a `state.thinkingLevel` field (pi-agent-core `Agent`) we
+  // read it live; otherwise we fall back to the value captured at call time.
   const modelDef = cfg?.models?.providers?.[provider]?.models?.find((m) => m.id === modelId);
   if (modelDef?.payloadPatch ?? modelDef?.thinkingPayloadPatch) {
     log.debug(`applying payload patch for ${provider}/${modelId}`);
+    const agentWithState = agent as { state?: { thinkingLevel?: string } };
+    const getThinkingLevel = (): ThinkLevel | undefined => {
+      const live = agentWithState.state?.thinkingLevel;
+      if (live) {
+        return live as ThinkLevel;
+      }
+      return thinkingLevel;
+    };
     agent.streamFn = createPayloadPatchWrapper(
       agent.streamFn,
       modelDef.payloadPatch,
       modelDef.thinkingPayloadPatch,
-      thinkingLevel,
+      getThinkingLevel,
     );
   }
 
